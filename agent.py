@@ -1,0 +1,460 @@
+# agent.py
+import json
+import os
+import re
+import shutil
+import subprocess
+import time
+from datetime import datetime
+from itertools import zip_longest
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import httpx
+from dotenv import load_dotenv
+from firecrawl import FirecrawlApp
+
+load_dotenv()
+
+# ── config ──────────────────────────────────────────────
+THRESHOLD = 70
+RESUME_FILE = "resume.md"
+
+# Stage 2 (scrape) limits — a search hit is often a listing/category page
+# (e.g. ph.jobstreet.com/nextjs-jobs) that contains many postings. We scrape
+# each discovered URL and extract the individual postings from it. Cap the
+# number of pages scraped per run so credit usage stays bounded.
+MAX_PAGES_TO_SCRAPE = 20
+SCRAPE_TIMEOUT_MS = 120000  # listing pages (JobStreet, LinkedIn) are JS-heavy
+
+# Firecrawl explicitly refuses to scrape linkedin.com ("Website Not
+# Supported"). Bright Data's Dataset API is used instead for LinkedIn only,
+# and only if BRIGHTDATA_API_KEY is set — otherwise LinkedIn hits just fall
+# back to their search snippet, same as any other scrape failure.
+BRIGHTDATA_API_KEY = os.environ.get("BRIGHTDATA_API_KEY")
+BRIGHTDATA_LINKEDIN_JOBS_DATASET_ID = os.environ.get(
+    "BRIGHTDATA_LINKEDIN_JOBS_DATASET_ID", "gd_lpfll7v5hcqtkxl6l"
+)
+BRIGHTDATA_POLL_INTERVAL_S = 10
+BRIGHTDATA_POLL_TIMEOUT_S = 300
+
+# What Firecrawl should pull out of each scraped page.
+EXTRACT_PROMPT = (
+    "Extract every individual job posting on this page. For each posting capture "
+    "the job title, the hiring company, the location, the direct URL to that "
+    "specific posting (not this listing/search page), the date it was posted, and "
+    "a short description. If the page is already a single job posting, return just "
+    "that one. Ignore navigation links, ads, related searches, and other pages."
+)
+JOB_EXTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "jobs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "company": {"type": "string"},
+                    "location": {"type": "string"},
+                    "url": {
+                        "type": "string",
+                        "description": "Direct link to the individual job posting.",
+                    },
+                    "posted_date": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["title"],
+            },
+        }
+    },
+    "required": ["jobs"],
+}
+
+# ── step 0: build search config from resume ───────────────
+def build_search_config() -> dict:
+    """Ask Claude to extract search config from the resume."""
+    config = run_claude_json("prompts/build_queries.md")
+    Path("output/search_config.json").write_text(json.dumps(config, indent=2))
+    print(f"  Roles: {config.get('target_roles')}")
+    print(f"  Skills: {config.get('key_skills')}")
+    print(f"  Queries ({len(config.get('search_queries', []))}): ready")
+    return config
+
+# ── url canonicalization ──────────────────────────────────
+def _canonical_host(host: str) -> str:
+    """Collapse www. and two-letter regional prefixes (in.indeed.com,
+    uk.linkedin.com, ph.jobstreet.com) so one site isn't treated as many."""
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    labels = host.split(".")
+    if len(labels) >= 3 and len(labels[0]) == 2:
+        host = ".".join(labels[1:])
+    return host
+
+def _dedup_key(url: str) -> str:
+    """Key for URL deduplication: canonical host + path + query."""
+    p = urlparse(url)
+    return f"{_canonical_host(p.netloc)}{p.path}?{p.query}"
+
+# ── step 1a: discover candidate pages via search ─────────
+def discover_pages(app: "FirecrawlApp", search_queries: list[str]) -> list[dict]:
+    """Run each search query and return unique candidate pages.
+
+    A page may be a single posting OR a listing/category page that contains
+    many postings — stage 1b sorts that out by scraping.
+
+    Results are interleaved round-robin across queries (first hit of each
+    query, then second of each, ...) so the MAX_PAGES_TO_SCRAPE cap doesn't
+    starve sources whose queries run later in the list.
+    """
+    seen_urls: set[str] = set()
+    results_per_query: list[list[dict]] = []
+
+    for query in search_queries:
+        print(f"  Searching: {query[:70]}...")
+        hits: list[dict] = []
+        try:
+            response = app.search(query, limit=10)
+            for r in response.web or []:
+                url = r.url
+                if not url or _dedup_key(url) in seen_urls:
+                    continue
+                seen_urls.add(_dedup_key(url))
+                hits.append({
+                    "url": url,
+                    "title": r.title or "",
+                    "description": r.description or "",
+                })
+        except Exception as e:
+            print(f"  Query failed: {e}")
+        print(f"    {len(hits)} new result(s)")
+        results_per_query.append(hits)
+
+    return [page for group in zip_longest(*results_per_query) for page in group if page]
+
+def _snippet_fallback(page: dict) -> list[dict]:
+    """Treat a page's search snippet as a single posting — used whenever a
+    real scrape isn't possible or yields nothing structured."""
+    return [{
+        "title": page["title"],
+        "company": "",
+        "location": "Remote",
+        "url": page["url"],
+        "description": page["description"],
+        "posted_date": "",
+        "source": _canonical_host(urlparse(page["url"]).netloc),
+    }]
+
+# ── step 1b: scrape each page and extract individual postings ─
+def extract_postings(app: "FirecrawlApp", page: dict) -> list[dict]:
+    """Scrape one page and extract the individual job postings it contains.
+
+    Falls back to the search snippet (treated as a single posting) if the
+    scrape fails or the page yields no structured postings, so we never lose
+    a result that was already an individual posting.
+    """
+    listing_url = page["url"]
+    source = _canonical_host(urlparse(listing_url).netloc)
+
+    try:
+        doc = app.scrape(
+            listing_url,
+            formats=[{"type": "json", "prompt": EXTRACT_PROMPT, "schema": JOB_EXTRACT_SCHEMA}],
+            only_main_content=True,
+            timeout=SCRAPE_TIMEOUT_MS,
+        )
+    except Exception as e:
+        print(f"    Scrape failed ({source}): {e} — keeping search snippet")
+        return _snippet_fallback(page)
+
+    data = doc.json if isinstance(doc.json, dict) else {}
+    raw_postings = data.get("jobs") or []
+    if not raw_postings:
+        return _snippet_fallback(page)
+
+    postings: list[dict] = []
+    for p in raw_postings:
+        if not isinstance(p, dict) or not (p.get("title") or "").strip():
+            continue
+        # Resolve the posting URL relative to the page; fall back to the page URL.
+        posting_url = (p.get("url") or "").strip()
+        posting_url = urljoin(listing_url, posting_url) if posting_url else listing_url
+        postings.append({
+            "title": p.get("title", "").strip(),
+            "company": (p.get("company") or "").strip(),
+            "location": (p.get("location") or "Remote").strip() or "Remote",
+            "url": posting_url,
+            "description": (p.get("description") or "").strip(),
+            "posted_date": (p.get("posted_date") or "").strip(),
+            "source": source,
+        })
+    return postings or _snippet_fallback(page)
+
+# ── step 1b (LinkedIn only): scrape via Bright Data ────────
+# Firecrawl outright refuses linkedin.com, so this uses Bright Data's
+# async Dataset API instead: trigger a collection for the batch of LinkedIn
+# URLs, poll until ready, then download the results.
+def _brightdata_scrape_linkedin_jobs(urls: list[str]) -> list[dict]:
+    if not BRIGHTDATA_API_KEY or not urls:
+        return []
+
+    headers = {"Authorization": f"Bearer {BRIGHTDATA_API_KEY}"}
+    base = "https://api.brightdata.com/datasets/v3"
+
+    try:
+        trigger = httpx.post(
+            f"{base}/trigger",
+            params={"dataset_id": BRIGHTDATA_LINKEDIN_JOBS_DATASET_ID, "format": "json"},
+            json=[{"url": u} for u in urls],
+            headers=headers,
+            timeout=30,
+        )
+        trigger.raise_for_status()
+        snapshot_id = trigger.json()["snapshot_id"]
+
+        deadline = time.monotonic() + BRIGHTDATA_POLL_TIMEOUT_S
+        status = None
+        while time.monotonic() < deadline:
+            time.sleep(BRIGHTDATA_POLL_INTERVAL_S)
+            progress = httpx.get(f"{base}/progress/{snapshot_id}", headers=headers, timeout=30)
+            progress.raise_for_status()
+            status = progress.json().get("status")
+            if status in ("ready", "failed"):
+                break
+        if status != "ready":
+            raise RuntimeError(f"snapshot did not complete in time (last status: {status})")
+
+        result = httpx.get(
+            f"{base}/snapshot/{snapshot_id}", params={"format": "json"}, headers=headers, timeout=60
+        )
+        result.raise_for_status()
+        data = result.json()
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"    Bright Data LinkedIn scrape failed: {e}")
+        return []
+
+def extract_linkedin_postings(pages: list[dict]) -> list[dict]:
+    """Scrape a batch of LinkedIn pages via Bright Data in one collection.
+
+    Falls back to each page's search snippet if BRIGHTDATA_API_KEY isn't set
+    or the collection fails/times out, same as the Firecrawl path.
+    """
+    raw_postings = _brightdata_scrape_linkedin_jobs([p["url"] for p in pages])
+    if not raw_postings:
+        return [job for page in pages for job in _snippet_fallback(page)]
+
+    postings: list[dict] = []
+    for p in raw_postings:
+        if not isinstance(p, dict):
+            continue
+        title = (p.get("title") or p.get("job_title") or "").strip()
+        if not title:
+            continue
+        postings.append({
+            "title": title,
+            "company": (p.get("company") or p.get("company_name") or "").strip(),
+            "location": (p.get("location") or p.get("job_location") or "Remote").strip() or "Remote",
+            "url": (p.get("url") or p.get("job_url") or "").strip(),
+            "description": (p.get("description") or p.get("job_summary") or "").strip(),
+            "posted_date": (p.get("posted_date") or p.get("job_posted_time") or "").strip(),
+            "source": "linkedin.com",
+        })
+    return postings or [job for page in pages for job in _snippet_fallback(page)]
+
+# ── step 1: search → scrape → individual postings ─────────
+def scrape_jobs(search_queries: list[str]) -> list[dict]:
+    app = FirecrawlApp(api_key=os.environ["FIRECRAWL_API_KEY"])
+
+    pages = discover_pages(app, search_queries)[:MAX_PAGES_TO_SCRAPE]
+    print(f"  Discovered {len(pages)} candidate pages; scraping up to {MAX_PAGES_TO_SCRAPE}...")
+
+    linkedin_pages = [p for p in pages if _canonical_host(urlparse(p["url"]).netloc) == "linkedin.com"]
+    other_pages = [p for p in pages if p not in linkedin_pages]
+
+    seen_urls: set[str] = set()
+    jobs: list[dict] = []
+
+    def _add_all(new_jobs: list[dict]) -> None:
+        for job in new_jobs:
+            url = job["url"]
+            if not url or _dedup_key(url) in seen_urls:
+                continue
+            seen_urls.add(_dedup_key(url))
+            jobs.append(job)
+
+    for page in other_pages:
+        print(f"  Scraping: {page['url'][:70]}...")
+        _add_all(extract_postings(app, page))
+
+    if linkedin_pages:
+        print(f"  Scraping {len(linkedin_pages)} LinkedIn page(s) via Bright Data...")
+        _add_all(extract_linkedin_postings(linkedin_pages))
+
+    return jobs
+
+# ── claude runner ─────────────────────────────────────────
+# shutil.which resolves the real executable (e.g. claude.cmd on Windows) —
+# passing a bare command name to subprocess.run fails there with WinError 2
+# because npm-installed shims aren't .exe and CreateProcess doesn't try
+# PATHEXT extensions on its own.
+CLAUDE_BIN = shutil.which("claude")
+
+def run_claude(prompt_file: str, context: str = "") -> str:
+    """Run a Claude prompt file and return the text result.
+    Read tool is allowed so Claude can read resume/jobs files.
+    Write tool is not allowed, forcing Claude to print output instead.
+    Optional context is appended to the prompt for inline data injection.
+    """
+    if not CLAUDE_BIN:
+        raise RuntimeError("claude CLI not found on PATH — install it and restart your terminal.")
+    prompt = Path(prompt_file).read_text(encoding="utf-8")
+    if context:
+        prompt = prompt + "\n" + context
+    # Pipe the prompt via stdin rather than passing it as an argument — on
+    # Windows, claude.cmd is a batch file launched through cmd.exe, which caps
+    # command lines at ~8191 chars regardless of the OS-wide 32767 limit.
+    result = subprocess.run(
+        [CLAUDE_BIN, "-p", "--output-format", "text", "--allowedTools", "Read"],
+        input=prompt,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        cwd=".",
+    )
+    if result.returncode != 0:
+        print(f"Claude error: {result.stderr}")
+        raise RuntimeError("Claude subprocess failed")
+    return result.stdout.strip()
+
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+
+def _extract_json(raw: str) -> str:
+    """Pull JSON out of a Claude response that may carry preamble text
+    and/or a markdown code fence despite being told to return raw JSON only.
+    """
+    fence_match = _JSON_FENCE_RE.search(raw)
+    if fence_match:
+        return fence_match.group(1).strip()
+    starts = [i for i in (raw.find("{"), raw.find("[")) if i != -1]
+    end = max(raw.rfind("}"), raw.rfind("]"))
+    if starts and end != -1 and end > starts[0]:
+        return raw[min(starts):end + 1]
+    return raw
+
+def run_claude_json(prompt_file: str, context: str = ""):
+    """Run a Claude prompt that must return JSON, and parse it."""
+    raw = run_claude(prompt_file, context)
+    if not raw:
+        raise RuntimeError(f"Claude returned empty output for {prompt_file}")
+    extracted = _extract_json(raw)
+    try:
+        return json.loads(extracted)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Claude returned invalid JSON for {prompt_file}: {e}\n---\n{raw[:300]}")
+
+# ── step 2: analyze scraped jobs via Claude ───────────────
+ANALYZE_BATCH_SIZE = 15  # keep each Claude call small enough to reliably
+                          # finish with the full JSON array instead of trailing
+                          # off into a narrative summary of the whole dataset
+
+def analyze_jobs() -> list[dict]:
+    """Run Claude analysis on raw_jobs.json in batches and write output/jobs.json."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    raw_jobs = json.loads(Path("output/raw_jobs.json").read_text(encoding="utf-8"))
+
+    all_jobs: list[dict] = []
+    for i in range(0, len(raw_jobs), ANALYZE_BATCH_SIZE):
+        batch = raw_jobs[i:i + ANALYZE_BATCH_SIZE]
+        print(f"  Analyzing jobs {i + 1}-{i + len(batch)} of {len(raw_jobs)}...")
+        context = f"Today's date is {today}.\n\n{json.dumps(batch, indent=2)}"
+        all_jobs.extend(run_claude_json("prompts/analyze.md", context=context))
+
+    Path("output/jobs.json").write_text(json.dumps(all_jobs, indent=2))
+    return all_jobs
+
+# ── cover letters ─────────────────────────────────────────
+def _slug(text: str, max_len: int = 40) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:max_len]
+
+def generate_cover_letters(jobs: list[dict]):
+    out_dir = Path("output/cover_letters")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for job in jobs:
+        company = job.get("company") or "unknown"
+        title = job.get("title") or "role"
+        slug = f"{_slug(company)}__{_slug(title)}"
+        out_path = out_dir / f"{slug}.md"
+
+        print(f"  Writing cover letter: {company} — {title[:50]}...")
+        try:
+            letter = run_claude("prompts/cover_letter.md", context=json.dumps(job, indent=2))
+            out_path.write_text(letter, encoding="utf-8")
+        except Exception as e:
+            print(f"  Failed for {slug}: {e}")
+
+# ── pipeline orchestrator ──────────────────────────────────
+def run_pipeline(on_progress=None) -> dict:
+    """Run the full 4-step pipeline.
+
+    Calls on_progress(step, label, status) at each stage where:
+      step   — int 1-4
+      label  — human-readable step name
+      status — "running" or "done"
+
+    Returns {"total": int, "above_threshold": int}.
+    Raises RuntimeError on any failure.
+    """
+    def emit(step, label, status):
+        if on_progress:
+            on_progress(step, label, status)
+
+    Path("output").mkdir(exist_ok=True)
+
+    if not Path(RESUME_FILE).exists():
+        raise RuntimeError(f"Missing {RESUME_FILE} — add your resume before running.")
+
+    emit(1, "Building search config", "running")
+    config = build_search_config()
+    search_queries = config.get("search_queries", [])
+    if not search_queries:
+        raise RuntimeError("No search queries generated — check prompts/build_queries.md")
+    emit(1, "Building search config", "done")
+
+    emit(2, "Scraping jobs", "running")
+    jobs = scrape_jobs(search_queries)
+    if not jobs:
+        raise RuntimeError("No jobs found — check your FIRECRAWL_API_KEY or search queries.")
+    Path("output/raw_jobs.json").write_text(json.dumps(jobs, indent=2))
+    emit(2, "Scraping jobs", "done")
+
+    emit(3, "Analyzing & scoring", "running")
+    all_jobs = analyze_jobs()
+    emit(3, "Analyzing & scoring", "done")
+
+    emit(4, "Generating cover letters", "running")
+    good_jobs = [j for j in all_jobs if j.get("score", 0) >= THRESHOLD]
+    apply_jobs = [j for j in good_jobs if j.get("verdict") == "apply"]
+    if apply_jobs:
+        generate_cover_letters(apply_jobs)
+    emit(4, "Generating cover letters", "done")
+
+    return {"total": len(all_jobs), "above_threshold": len(good_jobs)}
+
+# ── main pipeline ─────────────────────────────────────────
+def run():
+    def print_progress(step, label, status):
+        if status == "running":
+            print(f"\nStep {step}: {label}...")
+
+    try:
+        result = run_pipeline(on_progress=print_progress)
+        print(f"\nDone! {result['above_threshold']} of {result['total']} jobs above threshold ({THRESHOLD})")
+    except RuntimeError as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    run()
